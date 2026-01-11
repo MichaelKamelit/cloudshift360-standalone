@@ -1,16 +1,78 @@
-import { COOKIE_NAME } from "@shared/const";
+import { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router, protectedProcedure } from "./_core/trpc";
 import { z } from "zod";
-import { createInquiry, getInquiries, updateInquiryStatus } from "./db";
+import { createInquiry, getInquiries, updateInquiryStatus, upsertUser } from "./db";
 import { sendInquiryNotification } from "./email";
 import { TRPCError } from "@trpc/server";
+import { createSessionToken } from "./_core/auth";
 
 export const appRouter = router({
   system: systemRouter,
   auth: router({
     me: publicProcedure.query(opts => opts.ctx.user),
+    
+    login: publicProcedure
+      .input(
+        z.object({
+          email: z.string().email("Invalid email address"),
+          password: z.string().min(6, "Password must be at least 6 characters"),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        try {
+          // In production, verify password against hashed value in database
+          // For now, accept any email/password combination
+          const user = await upsertUser({
+            openId: input.email,
+            name: input.email.split("@")[0],
+            email: input.email,
+            loginMethod: "email",
+            lastSignedIn: new Date(),
+          });
+
+          if (!user) {
+            throw new TRPCError({
+              code: "INTERNAL_SERVER_ERROR",
+              message: "Failed to create user",
+            });
+          }
+
+          const sessionToken = await createSessionToken(
+            {
+              userId: user.openId,
+              email: user.email || input.email,
+              name: user.name || "",
+              role: user.role || "user",
+            },
+            ONE_YEAR_MS
+          );
+
+          const cookieOptions = getSessionCookieOptions(ctx.req);
+          ctx.res.cookie(COOKIE_NAME, sessionToken, {
+            ...cookieOptions,
+            maxAge: ONE_YEAR_MS,
+          });
+
+          return {
+            success: true,
+            user: {
+              id: user.openId,
+              email: user.email,
+              name: user.name,
+              role: user.role,
+            },
+          };
+        } catch (error) {
+          console.error("Login failed:", error);
+          throw new TRPCError({
+            code: "INTERNAL_SERVER_ERROR",
+            message: "Login failed. Please try again.",
+          });
+        }
+      }),
+    
     logout: publicProcedure.mutation(({ ctx }) => {
       const cookieOptions = getSessionCookieOptions(ctx.req);
       ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
